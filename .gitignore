@@ -35,6 +35,7 @@ env/
 
 # Data folders
 /vector_db/
+/dataset/
 
 # Compiled files
 *.so

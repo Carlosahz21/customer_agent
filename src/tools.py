@@ -10,6 +10,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
+from functools import reduce
 
 _current_user_id: Optional[int] = None
 
@@ -179,8 +180,72 @@ def structured_search_tool(
     LLM Usage Note:
     This tool is ideal for filtered browsing, purchase history analysis, or category breakdowns.
     """
-    pass
+    try:
+        def clean_column(df, col):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.dropna(subset=[col], inplace=True)
+            df[col] = df[col].astype(int)
+            return df
 
+        def prepare_data():
+            clean_column(products, "aisle_id")
+            clean_column(products, "department_id")
+            clean_column(aisles, "aisle_id")
+            clean_column(departments, "department_id")
+
+            catalog = products.merge(aisles, on="aisle_id").merge(departments, on="department_id")
+
+            if not history_only:
+                return catalog
+
+            user_id = get_user_id()
+            if user_id is None:
+                raise ValueError("User ID not set. Use set_user_id() before calling this tool.")
+
+            user_orders = orders[orders["user_id"] == user_id]
+            user_prior = prior[prior["order_id"].isin(user_orders["order_id"])]
+            enriched = user_prior.merge(products, on="product_id").merge(aisles, on="aisle_id").merge(departments, on="department_id")
+
+            stats = enriched.groupby("product_id").agg(
+                count=("order_id", "count"),
+                add_to_cart_order=("add_to_cart_order", "mean"),
+                reordered=("reordered", "max"),
+            ).reset_index()
+
+            enriched = enriched.drop_duplicates("product_id").merge(stats, on="product_id")
+            return enriched
+
+        def apply_filters(df):
+            filters = [
+                lambda d: d[d["product_name"].str.contains(product_name, case=False, na=False)] if product_name else d,
+                lambda d: d[d["department"] == department] if department else d,
+                lambda d: d[d["aisle"].str.contains(aisle, case=False, na=False)] if aisle else d,
+                lambda d: d[d["reordered"] == reordered] if history_only and reordered is not None else d,
+                lambda d: d[d["count"] >= min_orders] if history_only and min_orders is not None else d,
+            ]
+            return reduce(lambda acc, f: f(acc), filters, df)
+
+        def sort_and_limit(df):
+            if history_only and order_by:
+                df = df.sort_values(by=order_by, ascending=ascending)
+            return df.head(top_k) if top_k else df
+
+        def format_output(df):
+            if group_by:
+                grouped = df.groupby(group_by).size().reset_index(name="num_products")
+                return grouped.to_dict(orient="records")
+
+            base_cols = ["product_id", "product_name", "aisle", "department"]
+            extra_cols = [col for col in ["count", "reordered", "add_to_cart_order"] if col in df.columns]
+            return df[base_cols + extra_cols].to_dict(orient="records")
+
+        df = prepare_data()
+        df = apply_filters(df)
+        df = sort_and_limit(df)
+        return format_output(df)
+
+    except Exception as e:
+        return [{"error": f"Error during structured search: {str(e)}"}]
 
 # TODO
 class RouteToCustomerSupport(BaseModel):
@@ -234,8 +299,35 @@ _vector_store = None
 
 
 def get_vector_store():
-    pass
+    """
+    Initialize and return the Chroma vector store instance.
 
+    This function ensures that the vector store is loaded only once and reused across calls.
+    It uses HuggingFace embeddings and connects to the Chroma database directory and collection.
+
+    ---
+    Returns:
+    - Chroma: A Chroma vector store instance ready for similarity search.
+    """
+    global _vector_store, _embeddings
+
+    if _vector_store is None:
+        # Initialize embeddings
+        if _embeddings is None:
+            _embeddings = HuggingFaceEmbeddings(
+                model_name="mixedbread-ai/mxbai-embed-large-v1",
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"normalize_embeddings": True},
+            )
+
+        # Connect to Chroma vector store
+        _vector_store = Chroma(
+            collection_name=CHROMA_COLLECTION,
+            embedding_function=_embeddings,
+            persist_directory=CHROMA_DIR,
+        )
+
+    return _vector_store
 
 def make_query_prompt(query: str) -> str:
     return f"Represent this sentence for searching relevant passages: {query.strip().replace(chr(10), ' ')}"
@@ -284,7 +376,24 @@ def search_products(query: str, top_k: int = 5):
     ]
     ```
     """
-    pass
+    # Obtener la base de datos vectorial
+    vector_store = get_vector_store()
+    # Generar el prompt para la consulta
+    query_prompt = make_query_prompt(query)
+    # Realizar la búsqueda de similitud
+    results = vector_store.similarity_search(query_prompt, k=top_k)
+
+    # Formatear los resultados
+    return [
+        {
+            "product_id": doc.metadata["product_id"],
+            "product_name": doc.metadata["product_name"],
+            "aisle": doc.metadata["aisle"],
+            "department": doc.metadata["department"],
+            "text": doc.page_content,
+        }
+        for doc in results
+    ]
 
 
 # TODO
@@ -343,7 +452,22 @@ def search_tool(query: str) -> str:
     search_tool("something high protein for breakfast")
     ```
     """
-    pass
+    results = search_products(query)
+    if not results:
+        return "No products found matching your search."
+    # Format results into a readable string
+    formatted_results = "\n".join(
+        map(
+            lambda item: (
+                f"- {item['product_name']} (ID: {item['product_id']})\n"
+                f"  Aisle: {item['aisle']}\n"
+                f"  Department: {item['department']}\n"
+                f"  Details: {item['text']}"
+            ),
+            results
+        )
+    )
+    return formatted_results
 
 
 # ---- UPDATED: Cart tools with quantity support ----
@@ -495,7 +619,10 @@ def create_tool_node_with_fallback(tools: list) -> ToolNode:
     Returns:
     - ToolNode: A LangGraph-compatible tool node with error fallback logic.
     """
-    pass
+    return ToolNode(tools).with_fallbacks(
+    [RunnableLambda(handle_tool_error)],
+    exception_key="error"
+)
 
 
 __all__ = [
