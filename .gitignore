@@ -1,0 +1,51 @@
+# IDE settings
+.vscode/
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Environment variables
+.env
+
+# Black formatting backup files
+*.bak
+
+# Node.js dependencies
+node_modules/
+
+# Vendor folder
+vendor/
+
+# Build folders
+dist/
+build/
+
+# Python-related files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+
+# Data folders
+/vector_db/
+
+# Compiled files
+*.so
+
+# Test coverage reports
+.coverage
+htmlcov/
+*.cover
+
+# Streamlit cache
+.streamlit/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
